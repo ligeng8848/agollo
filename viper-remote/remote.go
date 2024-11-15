@@ -3,9 +3,11 @@ package remote
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	crypt "github.com/bketelsen/crypt/config"
@@ -49,7 +51,9 @@ func SetAgolloOptions(opts ...agollo.Option) {
 
 type viperConfigManager interface {
 	Get(key string) ([]byte, error)
+	GetMultipleNamespaces(keys []string) (map[string][]byte, error)
 	Watch(key string, stop chan bool) <-chan *viper.RemoteResponse
+	WatchMultipleNamespaces(keys []string, stop chan bool) <-chan *viper.RemoteResponse
 }
 
 type apolloConfigManager struct {
@@ -99,6 +103,21 @@ func (cm apolloConfigManager) Get(namespace string) ([]byte, error) {
 	return marshalConfigs(getConfigType(namespace), configs)
 }
 
+func (cm apolloConfigManager) GetMultipleNamespaces(namespaces []string) (map[string][]byte, error) {
+	configs := make(map[string][]byte)
+	var err error
+
+	for _, namespace := range namespaces {
+		singleConfig, singleErr := cm.Get(namespace)
+		if singleErr != nil {
+			err = singleErr // 仅记录错误
+		}
+		configs[namespace] = singleConfig
+	}
+
+	return configs, err
+}
+
 func marshalConfigs(configType string, configs map[string]interface{}) ([]byte, error) {
 	var bts []byte
 	var err error
@@ -140,6 +159,36 @@ func (cm apolloConfigManager) Watch(namespace string, stop chan bool) <-chan *vi
 	}()
 	return resp
 }
+func (cm apolloConfigManager) WatchMultipleNamespaces(namespaces []string, stop chan bool) <-chan *viper.RemoteResponse {
+	combinedResp := make(chan *viper.RemoteResponse)
+
+	// 创建一个监听每个namespace变化的goroutine
+	for _, namespace := range namespaces {
+		go func(ns string) {
+			backendResp := cm.agollo.WatchNamespace(ns, stop)
+			for {
+				select {
+				case <-stop:
+					return
+				case r := <-backendResp:
+					if r.Error != nil {
+						combinedResp <- &viper.RemoteResponse{
+							Value: nil,
+							Error: r.Error,
+						}
+						continue
+					}
+
+					configType := getConfigType(ns)
+					value, err := marshalConfigs(configType, r.NewValue)
+					combinedResp <- &viper.RemoteResponse{Value: value, Error: err}
+				}
+			}
+		}(namespace)
+	}
+
+	return combinedResp
+}
 
 type configProvider struct {
 }
@@ -149,13 +198,24 @@ func (rc configProvider) Get(rp viper.RemoteProvider) (io.Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	namespaces := strings.Split(rp.Path(), ",")
 	var b []byte
-	switch cm := cmt.(type) {
-	case viperConfigManager:
-		b, err = cm.Get(rp.Path())
-	case crypt.ConfigManager:
-		b, err = cm.Get(rp.Path())
+	if len(namespaces) == 1 {
+		switch cm := cmt.(type) {
+		case viperConfigManager:
+			b, err = cm.Get(namespaces[0])
+		case crypt.ConfigManager:
+			b, err = cm.Get(namespaces[0])
+		}
+	} else if len(namespaces) > 1 {
+		switch cm := cmt.(type) {
+		case viperConfigManager:
+			configs, err := cm.GetMultipleNamespaces(namespaces)
+			if err != nil {
+				return nil, err
+			}
+			b, err = mergeConfigs(configs)
+		}
 	}
 
 	if err != nil {
@@ -163,19 +223,53 @@ func (rc configProvider) Get(rp viper.RemoteProvider) (io.Reader, error) {
 	}
 	return bytes.NewReader(b), nil
 }
+func mergeConfigs(configs map[string][]byte) ([]byte, error) {
+	finalConfig := make(map[string]string)
 
+	for _, config := range configs {
+		lines := strings.Split(string(config), "\n")
+		for _, line := range lines {
+			if line == "" {
+				continue
+			}
+			kv := strings.SplitN(line, "=", 2)
+			if len(kv) != 2 {
+				return nil, fmt.Errorf("invalid config line: %s", line)
+			}
+			key := strings.TrimSpace(kv[0])
+			value := strings.TrimSpace(kv[1])
+			finalConfig[key] = value
+		}
+	}
+	var b bytes.Buffer
+	for k, v := range finalConfig {
+		fmt.Fprintf(&b, "%s = %s\n", k, v)
+	}
+	return b.Bytes(), nil
+}
 func (rc configProvider) Watch(rp viper.RemoteProvider) (io.Reader, error) {
 	cmt, err := getConfigManager(rp)
 	if err != nil {
 		return nil, err
 	}
-
+	namespaces := strings.Split(rp.Path(), ",")
 	var resp []byte
-	switch cm := cmt.(type) {
-	case viperConfigManager:
-		resp, err = cm.Get(rp.Path())
-	case crypt.ConfigManager:
-		resp, err = cm.Get(rp.Path())
+	if len(namespaces) == 1 {
+		switch cm := cmt.(type) {
+		case viperConfigManager:
+			resp, err = cm.Get(namespaces[0])
+		case crypt.ConfigManager:
+			resp, err = cm.Get(namespaces[0])
+		}
+	} else if len(namespaces) > 1 {
+		switch cm := cmt.(type) {
+		case viperConfigManager:
+			configs, err := cm.GetMultipleNamespaces(namespaces)
+			if err != nil {
+				return nil, err
+			}
+			resp, err = mergeConfigs(configs)
+		}
 	}
 
 	if err != nil {
@@ -190,7 +284,15 @@ func (rc configProvider) WatchChannel(rp viper.RemoteProvider) (<-chan *viper.Re
 	if err != nil {
 		return nil, nil
 	}
-
+	namespaces := strings.Split(rp.Path(), ",")
+	if len(namespaces) > 1 {
+		switch cm := cmt.(type) {
+		case viperConfigManager:
+			quitwc := make(chan bool)
+			viperResponsCh := cm.WatchMultipleNamespaces(namespaces, quitwc)
+			return viperResponsCh, quitwc
+		}
+	}
 	switch cm := cmt.(type) {
 	case viperConfigManager:
 		quitwc := make(chan bool)
