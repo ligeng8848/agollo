@@ -133,8 +133,9 @@ func (cm apolloConfigManager) GetMultipleNamespaces(namespaces []string) ([]byte
 				newConfigs["content"] = string(b)
 			}
 		case "properties":
-			viper.MergeConfigMap(configs)
-			newConfigs = viper.AllSettings()
+			for k, v := range configs {
+				newConfigs[k] = v
+			}
 		}
 	}
 
@@ -229,6 +230,7 @@ func (cm apolloConfigManager) WatchMultipleNamespaces(namespaces []string, stop 
 					}
 
 					configType := getConfigType(ns)
+					var mergedConfigs map[string]interface{}
 					switch configType {
 					case "json", "yml", "yaml", "xml":
 						content := r.NewValue["content"]
@@ -240,12 +242,13 @@ func (cm apolloConfigManager) WatchMultipleNamespaces(namespaces []string, stop 
 								continue
 							}
 							viper.MergeConfigMap(tempConfig)
+							mergedConfigs = viper.AllSettings()
 						}
 					case "properties":
-						viper.MergeConfigMap(r.NewValue)
+						mergedConfigs = r.NewValue
 					}
-					mergedConfigs := viper.AllSettings()
-					value, err := marshalConfig(configType, mergedConfigs)
+
+					value, err := marshalConfigs(configType, mergedConfigs)
 					combinedResp <- &viper.RemoteResponse{Value: value, Error: err}
 				}
 			}
