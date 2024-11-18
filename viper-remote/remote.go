@@ -2,6 +2,8 @@ package remote
 
 import (
 	"bytes"
+	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	crypt "github.com/bketelsen/crypt/config"
 	"github.com/shima-park/agollo"
 	"github.com/spf13/viper"
+	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -51,7 +54,7 @@ func SetAgolloOptions(opts ...agollo.Option) {
 
 type viperConfigManager interface {
 	Get(key string) ([]byte, error)
-	GetMultipleNamespaces(keys []string) (map[string][]byte, error)
+	GetMultipleNamespaces(keys []string) ([]byte, error)
 	Watch(key string, stop chan bool) <-chan *viper.RemoteResponse
 	WatchMultipleNamespaces(keys []string, stop chan bool) <-chan *viper.RemoteResponse
 }
@@ -103,19 +106,65 @@ func (cm apolloConfigManager) Get(namespace string) ([]byte, error) {
 	return marshalConfigs(getConfigType(namespace), configs)
 }
 
-func (cm apolloConfigManager) GetMultipleNamespaces(namespaces []string) (map[string][]byte, error) {
-	configs := make(map[string][]byte)
-	var err error
-
+func (cm apolloConfigManager) GetMultipleNamespaces(namespaces []string) ([]byte, error) {
+	newConfigs := make(map[string]interface{})
+	var configType string
+	var b []byte
 	for _, namespace := range namespaces {
-		singleConfig, singleErr := cm.Get(namespace)
-		if singleErr != nil {
-			err = singleErr // 仅记录错误
+		configs := cm.agollo.GetNameSpace(namespace)
+		configType = getConfigType(namespace)
+		// 根据类型进行合并
+		switch configType {
+		case "json", "yml", "yaml", "xml":
+			content := configs["content"]
+			if content != nil {
+				var tempConfig map[string]interface{}
+				err := unmarshalConfig(configType, []byte(content.(string)), &tempConfig)
+				if err != nil {
+					return nil, err
+				}
+				// 执行合并
+				viper.MergeConfigMap(tempConfig)
+				mergedConfigs := viper.AllSettings()
+				b, err = marshalConfig(configType, mergedConfigs)
+				if err != nil {
+					return nil, err
+				}
+				newConfigs["content"] = string(b)
+			}
+		case "properties":
+			viper.MergeConfigMap(configs)
+			newConfigs = viper.AllSettings()
 		}
-		configs[namespace] = singleConfig
 	}
 
-	return configs, err
+	return marshalConfigs(configType, newConfigs)
+}
+
+func unmarshalConfig(configType string, data []byte, config *map[string]interface{}) error {
+	switch configType {
+	case "json":
+		return json.Unmarshal(data, config)
+	case "yml", "yaml":
+		return yaml.Unmarshal(data, config)
+	case "xml":
+		return xml.Unmarshal(data, config)
+	default:
+		return fmt.Errorf("unsupported config type: %s", configType)
+	}
+}
+
+func marshalConfig(configType string, config map[string]interface{}) ([]byte, error) {
+	switch configType {
+	case "json":
+		return json.Marshal(config)
+	case "yml", "yaml":
+		return yaml.Marshal(config)
+	case "xml":
+		return xml.Marshal(config)
+	default:
+		return nil, fmt.Errorf("unsupported config type: %s", configType)
+	}
 }
 
 func marshalConfigs(configType string, configs map[string]interface{}) ([]byte, error) {
@@ -180,7 +229,23 @@ func (cm apolloConfigManager) WatchMultipleNamespaces(namespaces []string, stop 
 					}
 
 					configType := getConfigType(ns)
-					value, err := marshalConfigs(configType, r.NewValue)
+					switch configType {
+					case "json", "yml", "yaml", "xml":
+						content := r.NewValue["content"]
+						if content != nil {
+							var tempConfig map[string]interface{}
+							err := unmarshalConfig(configType, []byte(content.(string)), &tempConfig)
+							if err != nil {
+								combinedResp <- &viper.RemoteResponse{Value: nil, Error: err}
+								continue
+							}
+							viper.MergeConfigMap(tempConfig)
+						}
+					case "properties":
+						viper.MergeConfigMap(r.NewValue)
+					}
+					mergedConfigs := viper.AllSettings()
+					value, err := marshalConfig(configType, mergedConfigs)
 					combinedResp <- &viper.RemoteResponse{Value: value, Error: err}
 				}
 			}
@@ -210,11 +275,10 @@ func (rc configProvider) Get(rp viper.RemoteProvider) (io.Reader, error) {
 	} else if len(namespaces) > 1 {
 		switch cm := cmt.(type) {
 		case viperConfigManager:
-			configs, err := cm.GetMultipleNamespaces(namespaces)
+			b, err = cm.GetMultipleNamespaces(namespaces)
 			if err != nil {
 				return nil, err
 			}
-			b, err = mergeConfigs(configs)
 		}
 	}
 
@@ -223,30 +287,7 @@ func (rc configProvider) Get(rp viper.RemoteProvider) (io.Reader, error) {
 	}
 	return bytes.NewReader(b), nil
 }
-func mergeConfigs(configs map[string][]byte) ([]byte, error) {
-	finalConfig := make(map[string]string)
 
-	for _, config := range configs {
-		lines := strings.Split(string(config), "\n")
-		for _, line := range lines {
-			if line == "" {
-				continue
-			}
-			kv := strings.SplitN(line, "=", 2)
-			if len(kv) != 2 {
-				return nil, fmt.Errorf("invalid config line: %s", line)
-			}
-			key := strings.TrimSpace(kv[0])
-			value := strings.TrimSpace(kv[1])
-			finalConfig[key] = value
-		}
-	}
-	var b bytes.Buffer
-	for k, v := range finalConfig {
-		fmt.Fprintf(&b, "%s = %s\n", k, v)
-	}
-	return b.Bytes(), nil
-}
 func (rc configProvider) Watch(rp viper.RemoteProvider) (io.Reader, error) {
 	cmt, err := getConfigManager(rp)
 	if err != nil {
@@ -264,11 +305,7 @@ func (rc configProvider) Watch(rp viper.RemoteProvider) (io.Reader, error) {
 	} else if len(namespaces) > 1 {
 		switch cm := cmt.(type) {
 		case viperConfigManager:
-			configs, err := cm.GetMultipleNamespaces(namespaces)
-			if err != nil {
-				return nil, err
-			}
-			resp, err = mergeConfigs(configs)
+			resp, err = cm.GetMultipleNamespaces(namespaces)
 		}
 	}
 
