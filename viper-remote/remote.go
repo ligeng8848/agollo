@@ -228,28 +228,13 @@ func (cm apolloConfigManager) WatchMultipleNamespaces(namespaces []string, stop 
 						}
 						continue
 					}
-
-					configType := getConfigType(ns)
-					var mergedConfigs map[string]interface{}
-					switch configType {
-					case "json", "yml", "yaml", "xml":
-						content := r.NewValue["content"]
-						if content != nil {
-							var tempConfig map[string]interface{}
-							err := unmarshalConfig(configType, []byte(content.(string)), &tempConfig)
-							if err != nil {
-								combinedResp <- &viper.RemoteResponse{Value: nil, Error: err}
-								continue
-							}
-							viper.MergeConfigMap(tempConfig)
-							mergedConfigs = viper.AllSettings()
-						}
-					case "properties":
-						mergedConfigs = r.NewValue
+					// 重载所有配置以确保多配置的优先级
+					allConfigs, err := cm.GetMultipleNamespaces(namespaces)
+					if err != nil {
+						combinedResp <- &viper.RemoteResponse{Value: nil, Error: err}
+						continue
 					}
-
-					value, err := marshalConfigs(configType, mergedConfigs)
-					combinedResp <- &viper.RemoteResponse{Value: value, Error: err}
+					combinedResp <- &viper.RemoteResponse{Value: allConfigs, Error: err}
 				}
 			}
 		}(namespace)
